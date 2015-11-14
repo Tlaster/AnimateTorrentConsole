@@ -7,20 +7,19 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Timers;
-using System.Xml;
 using System.Xml.Linq;
 
 namespace TorrentConsole
 {
-    class Program
+    internal class Program
     {
         private static Timer _timer;
         private static Session _session;
         private static Dictionary<AddTorrentParams, TorrentHandle> _dic;
+
         private static void _timer_Elapsed(object sender, ElapsedEventArgs e)
         {
             if (_dic.Count == 0) return;
@@ -33,14 +32,14 @@ namespace TorrentConsole
                     {
                         var info = new DirectoryInfo(status.SavePath).GetFiles().Where(file => file.Name == status.Name).FirstOrDefault();
                         info.MoveTo($"{info.DirectoryName}{item.Key.Name}{Path.GetExtension(info.FullName)}");
+                        Console.WriteLine($"{status.Name} is finished");
                     }
                     if (status.Error != "")
                     {
                         _session.RemoveTorrent(item.Value);
                         _dic[item.Key] = _session.AddTorrent(item.Key);
+                        Console.WriteLine($"{status.Name} error,try again");
                     }
-                    Console.Write($"{status.Name} downloaded");
-                    Console.WriteLine($"{status.Progress * 100:F4} downloaded");
                 }
             }
         }
@@ -50,11 +49,12 @@ namespace TorrentConsole
             throw new NotImplementedException();
         }
 
-        static void Main(string[] args)
+        private static void Main(string[] args)
         {
+            Console.WriteLine("init...");
             AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
-            _dic = new Dictionary<AddTorrentParams, TorrentHandle>(new EqualityComparer<AddTorrentParams,string>(item=>item.Url));
-            _session = new Session(); 
+            _dic = new Dictionary<AddTorrentParams, TorrentHandle>(new EqualityComparer<AddTorrentParams, string>(item => item.Url));
+            _session = new Session();
             _session.ListenOn(6881, 6889);
             var settings = _session.QuerySettings();
             settings.UploadRateLimit = 30 * 1024;
@@ -63,7 +63,14 @@ namespace TorrentConsole
             _timer = new Timer(TimeSpan.FromSeconds(5d).TotalMilliseconds);
             _timer.Elapsed += _timer_Elapsed;
             _timer.Start();
-            Task.Run(async() =>
+            Console.WriteLine("please set the delay interval(in minutes):");
+            double interval = 30d;
+            while (!double.TryParse(Console.ReadLine(), out interval))
+            {
+                Console.WriteLine("error, please try again:");
+            }
+            Console.WriteLine("running...");
+            Task.Run(async () =>
             {
                 while (true)
                 {
@@ -104,18 +111,20 @@ namespace TorrentConsole
                     dataTable.Dispose();
                     dataTable = null;
                     if (list.Count == 0) continue;
-                    foreach (var item in list)
+                    Parallel.ForEach(list, item =>
                     {
                         var torrentParams = new AddTorrentParams { SavePath = item.DirPath, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
                         var handle = _session.AddTorrent(torrentParams);
                         _dic.Add(torrentParams, handle);
-                    }
-                    await Task.Delay(TimeSpan.FromSeconds(30d));
+                        Console.WriteLine($"{item.Title} start downloading...");
+                    });
+                    await Task.Delay(TimeSpan.FromMinutes(interval));
                 }
             }).Wait();
         }
     }
-    class EqualityComparer<T, V> : IEqualityComparer<T>
+
+    internal class EqualityComparer<T, V> : IEqualityComparer<T>
     {
         private Func<T, V> _keySelector;
 
