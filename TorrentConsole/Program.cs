@@ -91,6 +91,7 @@ namespace TorrentConsole
                     connection.Close();
                     connection.Dispose();
                     connection = null;
+                    //\[Leopard-Raws\](.+) - ([0-9]+) RAW
                     XDocument doc = XDocument.Parse(rssStr);
                     var list = (from item in doc.Descendants()
                                 from dbitem in dataTable.Select()
