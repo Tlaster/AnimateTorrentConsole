@@ -10,17 +10,26 @@ using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Timers;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Xml.Linq;
 
 namespace TorrentConsole
 {
     internal class Program
     {
+        private const string REGEX_PATTERN = @"\[Leopard-Raws\](.+) - ([0-9]+) RAW";
+        private const string DATABASE_NAME = "AnimateDatabase";
+        private const string ANIMATELIST_TABLE_NAME = "AnimateList";
+        private const string DEFAULT_DOWNLOAD_FOLDER = @"C:\Animate\";
+
+        private static string _downloadFolder = DEFAULT_DOWNLOAD_FOLDER;
         private static Timer _timer;
         private static Session _session;
         private static Dictionary<AddTorrentParams, TorrentHandle> _dic;
 
-        private static void _timer_Elapsed(object sender, ElapsedEventArgs e)
+        private static async void _timer_Elapsed(object sender, ElapsedEventArgs e)
         {
             if (_dic.Count == 0) return;
             for (int i = 0; i < _dic.Count; i++)
@@ -32,6 +41,7 @@ namespace TorrentConsole
                     {
                         var info = new DirectoryInfo(status.SavePath).GetFiles().Where(file => file.Name == status.Name).FirstOrDefault();
                         info.MoveTo($"{info.DirectoryName}{item.Key.Name}{Path.GetExtension(info.FullName)}");
+                        await ImportMedia(info.FullName, 1, 12);
                         Console.WriteLine($"{status.Name} is finished");
                     }
                     if (status.Error != "")
@@ -48,7 +58,35 @@ namespace TorrentConsole
         {
             throw new NotImplementedException();
         }
-
+        static async Task ImportMedia(string mediaFile, int waitTime, int position, int imageWidth = 1280, int imageHeight = 720)
+        {
+            MediaPlayer player = new MediaPlayer { Volume = 0, ScrubbingEnabled = true };
+            player.Open(new Uri(mediaFile));
+            player.Pause();
+            player.Position = TimeSpan.FromSeconds(position);
+            //We need to give MediaPlayer some time to load. 
+            //The efficiency of the MediaPlayer depends                 
+            //upon the capabilities of the machine it is running on and 
+            //would be different from time to time
+            await Task.Delay(TimeSpan.FromSeconds(waitTime));
+            RenderTargetBitmap rtb = new RenderTargetBitmap(imageWidth, imageHeight, 96, 96, PixelFormats.Pbgra32);
+            DrawingVisual dv = new DrawingVisual();
+            using (DrawingContext dc = dv.RenderOpen())
+                dc.DrawVideo(player, new Rect(0, 0, imageWidth, imageHeight));
+            rtb.Render(dv);
+            Duration duration = player.NaturalDuration;
+            int videoLength = 0;
+            if (duration.HasTimeSpan)
+                videoLength = (int)duration.TimeSpan.TotalSeconds;
+            using (var file = File.Create($"{Path.GetDirectoryName(mediaFile)}\\{Path.GetFileNameWithoutExtension(mediaFile)}.png"))
+            {
+                BitmapFrame frame = BitmapFrame.Create(rtb).GetCurrentValueAsFrozen() as BitmapFrame;
+                BitmapEncoder encoder = new JpegBitmapEncoder();
+                encoder.Frames.Add(frame as BitmapFrame);
+                encoder.Save(file);
+            }
+            player.Close();
+        }
         private static void Main(string[] args)
         {
             Console.WriteLine("init...");
@@ -60,9 +98,24 @@ namespace TorrentConsole
             settings.UploadRateLimit = 30 * 1024;
             settings.SeedTimeLimit = 1;
             _session.SetSettings(settings);
-            _timer = new Timer(TimeSpan.FromSeconds(5d).TotalMilliseconds);
+            if (!CheckDatabaseExists(DATABASE_NAME))
+            {
+                CreateDatabase(DATABASE_NAME);
+                CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
+            }
+            else if(!CheckTableExists(DATABASE_NAME, ANIMATELIST_TABLE_NAME))
+            {
+                CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
+            }
+            Console.WriteLine($"please set the download folder(by default: {_downloadFolder} ,press enter to keep the default):");
+            _downloadFolder = Console.ReadLine();
+            if (string.IsNullOrEmpty(_downloadFolder) || string.IsNullOrWhiteSpace(_downloadFolder))
+            {
+                _downloadFolder = DEFAULT_DOWNLOAD_FOLDER;
+            }
+            Directory.CreateDirectory(_downloadFolder);
+            _timer = new Timer(TimeSpan.FromSeconds(10d).TotalMilliseconds);
             _timer.Elapsed += _timer_Elapsed;
-            _timer.Start();
             Console.WriteLine("please set the delay interval(in minutes):");
             double interval = 30d;
             while (!double.TryParse(Console.ReadLine(), out interval))
@@ -70,10 +123,12 @@ namespace TorrentConsole
                 Console.WriteLine("error, please try again:");
             }
             Console.WriteLine("running...");
+            _timer.Start();
             Task.Run(async () =>
             {
                 while (true)
                 {
+                    await Task.Delay(TimeSpan.FromMinutes(interval));
                     var rssStr = "";
                     try
                     {
@@ -83,48 +138,123 @@ namespace TorrentConsole
                     catch (HttpRequestException) { continue; }
                     catch (WebException) { continue; }
                     if (string.IsNullOrEmpty(rssStr)) continue;
-                    SqlConnection connection = new SqlConnection("server=localhost;database=AnimateDataBase;Integrated Security=yes");
-                    await connection.OpenAsync();
-                    DataTable dataTable = new DataTable();
-                    using (SqlDataAdapter sqladapter = new SqlDataAdapter("select DirPath,RegexPattern from AnimateList", connection))
-                        sqladapter.Fill(dataTable);
-                    connection.Close();
-                    connection.Dispose();
-                    connection = null;
-                    //\[Leopard-Raws\](.+) - ([0-9]+) RAW
                     XDocument doc = XDocument.Parse(rssStr);
                     var list = (from item in doc.Descendants()
-                                from dbitem in dataTable.Select()
                                 where item.Name == "item"
-                                //find the item
-                                && Regex.IsMatch(item.Descendants().Where(node => node.Name == "title").FirstOrDefault().Value, dbitem.ItemArray[1].ToString())
-                                //check the item if exist
-                                && new DirectoryInfo(dbitem.ItemArray[0].ToString()).GetFiles().Where(file => Path.GetFileNameWithoutExtension(file.FullName) == Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, dbitem.ItemArray[1].ToString()).Groups[1].Value).FirstOrDefault() == null
+                                //check the item if exists
+                                && Directory.CreateDirectory(DEFAULT_DOWNLOAD_FOLDER + Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim()).GetFiles().Where(file => Path.GetFileNameWithoutExtension(file.Name) == Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value).Count() == 0
                                 //check the item if is downloading
                                 && _dic.Where(download => download.Key.Url == item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value).Count() == 0
                                 select new
                                 {
-                                    Title = item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value,
+                                    Title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[0].Value,
                                     Link = item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value,
-                                    DirPath = dbitem.ItemArray[0].ToString(),
-                                    FileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, dbitem.ItemArray[1].ToString()).Groups[1].Value,
+                                    Name = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim(),
+                                    FileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value.Trim(),
                                 }).ToList();
-                    dataTable.Dispose();
-                    dataTable = null;
                     if (list.Count == 0) continue;
-                    Parallel.ForEach(list, item =>
+                    using (SqlConnection connection = new SqlConnection($"server=localhost;database={DATABASE_NAME};Integrated Security=yes"))
                     {
-                        var torrentParams = new AddTorrentParams { SavePath = item.DirPath, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
-                        var handle = _session.AddTorrent(torrentParams);
-                        _dic.Add(torrentParams, handle);
-                        Console.WriteLine($"{item.Title} start downloading...");
-                    });
-                    await Task.Delay(TimeSpan.FromMinutes(interval));
+                        await connection.OpenAsync();
+                        using (DataTable dataTable = new DataTable())
+                        {
+                            using (SqlDataAdapter sqladapter = new SqlDataAdapter($"select Name from {ANIMATELIST_TABLE_NAME}", connection))
+                                sqladapter.Fill(dataTable);
+
+                            foreach (var item in list)
+                            {
+                                if (dataTable.Select().Where(dbitem => dbitem.ItemArray[0].ToString() == item.Name).Count() == 0)
+                                {
+                                    using (SqlCommand sqlCmd = new SqlCommand($"insert into AnimateList(Name,DirPath) values ('{item.Name}','{DEFAULT_DOWNLOAD_FOLDER + item.Name}');", connection))
+                                        sqlCmd.ExecuteScalar();
+                                }
+                                var torrentParams = new AddTorrentParams { SavePath = DEFAULT_DOWNLOAD_FOLDER + item.Name, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
+                                var handle = _session.AddTorrent(torrentParams);
+                                _dic.Add(torrentParams, handle);
+                                Console.WriteLine($"{item.Title} start downloading...");
+                            }
+                        }
+                        connection.Close();
+                    }
                 }
             }).Wait();
         }
-    }
 
+        private static void CreateTable(string databaseName,string tableName, string tableAttribute)
+        {
+            using (SqlConnection tmpConn = new SqlConnection($"server=localhost;database={databaseName};Integrated Security=yes"))
+            {
+                using (SqlCommand sqlCmd = new SqlCommand($"create table {tableName} ( {tableAttribute} )", tmpConn))
+                {
+                    tmpConn.Open();
+                    sqlCmd.ExecuteScalar();
+                    tmpConn.Close();
+                }
+            }
+        }
+
+        private static void CreateDatabase(string databaseName)
+        {
+            using (SqlConnection tmpConn = new SqlConnection("server=localhost;Integrated Security=yes"))
+            {
+                using (SqlCommand sqlCmd = new SqlCommand($"create database {databaseName}", tmpConn))
+                {
+                    tmpConn.Open();
+                    sqlCmd.ExecuteScalar();
+                    tmpConn.Close();
+                }
+            }
+        }
+
+        private static bool CheckTableExists(string databaseName,string tableName)
+        {
+            try
+            {
+                using (SqlConnection tmpConn = new SqlConnection($"server=localhost;database={databaseName};Integrated Security=yes"))
+                {
+                    using (SqlCommand sqlCmd = new SqlCommand($"SELECT count(*) as IsExists FROM dbo.sysobjects where id = object_id('[dbo].[{tableName}]')", tmpConn))
+                    {
+                        tmpConn.Open();
+                        object resultObj = sqlCmd.ExecuteScalar();
+                        int databaseID = 0;
+                        if (resultObj != null)
+                            int.TryParse(resultObj.ToString(), out databaseID);
+                        tmpConn.Close();
+                        return databaseID == 1;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static bool CheckDatabaseExists(string databaseName)
+        {
+            try
+            {
+                using (SqlConnection tmpConn = new SqlConnection("server=localhost;Integrated Security=yes"))
+                {
+                    using (SqlCommand sqlCmd = new SqlCommand($"select database_id from sys.databases where Name = '{databaseName}'", tmpConn))
+                    {
+                        tmpConn.Open();
+                        object resultObj = sqlCmd.ExecuteScalar();
+                        int databaseID = 0;
+                        if (resultObj != null)
+                            int.TryParse(resultObj.ToString(), out databaseID);
+                        tmpConn.Close();
+                        return databaseID > 0;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+    }
     internal class EqualityComparer<T, V> : IEqualityComparer<T>
     {
         private Func<T, V> _keySelector;
