@@ -56,6 +56,8 @@ namespace TorrentConsole
                         var info = new DirectoryInfo(status.SavePath).GetFiles().Where(file => file.Name == status.Name).FirstOrDefault();
                         info.MoveTo($"{info.DirectoryName}{item.Key.Name}{Path.GetExtension(info.FullName)}");
                         await ImportMedia(info.FullName, 1, 12);
+                        _session.RemoveTorrent(item.Value);
+                        _dic.Remove(item.Key);
                         Console.WriteLine($"{status.Name} is finished");
                     }
                     if (status.Error != "")
@@ -227,6 +229,7 @@ namespace TorrentConsole
                     var rssStr = "";
                     try
                     {
+                        Console.WriteLine("Getting rss...");
                         using (var client = new HttpClient())
                             rssStr = await client.GetStringAsync("http://leopard-raws.org/rss.php");
                     }
@@ -250,13 +253,13 @@ namespace TorrentConsole
                     if (list.Count == 0) continue;
                     foreach (var item in list)
                     {
-                        if (!Directory.Exists(DEFAULT_DOWNLOAD_FOLDER + item.Name))
+                        if (!Directory.Exists(_downloadFolder + item.Name))
                         {
-                            Directory.CreateDirectory(DEFAULT_DOWNLOAD_FOLDER + item.Name);
+                            Directory.CreateDirectory(_downloadFolder + item.Name);
                             if (_enableSQLServer)
                             {
                                 using (SqlConnection connection = new SqlConnection($"server=localhost;database={DATABASE_NAME};Integrated Security=yes"))
-                                using (SqlCommand sqlCmd = new SqlCommand($"insert into {ANIMATELIST_TABLE_NAME}(Name,DirPath) values ('{item.Name}','{DEFAULT_DOWNLOAD_FOLDER + item.Name}');", connection))
+                                using (SqlCommand sqlCmd = new SqlCommand($"insert into {ANIMATELIST_TABLE_NAME}(Name,DirPath) values ('{item.Name}','{_downloadFolder + item.Name}');", connection))
                                 {
                                     connection.Open();
                                     sqlCmd.ExecuteScalar();
@@ -264,7 +267,7 @@ namespace TorrentConsole
                                 }
                             }
                         }
-                        var torrentParams = new AddTorrentParams { SavePath = DEFAULT_DOWNLOAD_FOLDER + item.Name, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
+                        var torrentParams = new AddTorrentParams { SavePath = _downloadFolder + item.Name, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
                         var handle = _session.AddTorrent(torrentParams);
                         _dic.Add(torrentParams, handle);
                         Console.WriteLine($"{item.Title} start downloading...");
@@ -277,7 +280,7 @@ namespace TorrentConsole
         {
             var title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim();
             var fileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value;
-            return Directory.Exists(DEFAULT_DOWNLOAD_FOLDER + title) ? Directory.GetFiles(DEFAULT_DOWNLOAD_FOLDER + title, fileName).Count() == 0 : true;
+            return Directory.Exists(_downloadFolder + title) ? Directory.GetFiles(_downloadFolder + title, fileName).Count() == 0 : true;
         }
     }
 }
