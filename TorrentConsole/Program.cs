@@ -41,6 +41,7 @@ namespace TorrentConsole
         private static string _downloadFolder = DEFAULT_DOWNLOAD_FOLDER;
         private static Session _session;
         private static Timer _timer;
+        private static bool _enableSQLServer;
 
         private static async void _timer_Elapsed(object sender, ElapsedEventArgs e)
         {
@@ -143,7 +144,7 @@ namespace TorrentConsole
 
         private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
-            throw new NotImplementedException();
+            //TODO:make log
         }
 
         private static async Task ImportMedia(string mediaFile, int waitTime, int position, int imageWidth = 1280, int imageHeight = 720)
@@ -189,14 +190,19 @@ namespace TorrentConsole
             _session.SetSettings(settings);
             _timer = new Timer(TimeSpan.FromSeconds(10d).TotalMilliseconds);
             _timer.Elapsed += _timer_Elapsed;
-            if (!CheckDatabaseExists(DATABASE_NAME))
+            Console.WriteLine("Enable SQL Server?(Y/N):");
+            _enableSQLServer = Console.ReadLine() == "Y";
+            if (_enableSQLServer)
             {
-                CreateDatabase(DATABASE_NAME);
-                CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
-            }
-            else if (!CheckTableExists(DATABASE_NAME, ANIMATELIST_TABLE_NAME))
-            {
-                CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
+                if (!CheckDatabaseExists(DATABASE_NAME))
+                {
+                    CreateDatabase(DATABASE_NAME);
+                    CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
+                }
+                else if (!CheckTableExists(DATABASE_NAME, ANIMATELIST_TABLE_NAME))
+                {
+                    CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
+                }
             }
             Console.WriteLine($"please set the download folder(by default: {_downloadFolder} ,press enter to keep the default):");
             _downloadFolder = Console.ReadLine();
@@ -230,6 +236,7 @@ namespace TorrentConsole
                     XDocument doc = XDocument.Parse(rssStr);
                     var list = (from item in doc.Descendants()
                                 where item?.Name == "item"
+                                //check the item if exist
                                 && CheckExists(item)
                                 //check the item if is downloading
                                 && _dic.Where(download => download.Key.Url == item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value).Count() == 0
@@ -246,12 +253,15 @@ namespace TorrentConsole
                         if (!Directory.Exists(DEFAULT_DOWNLOAD_FOLDER + item.Name))
                         {
                             Directory.CreateDirectory(DEFAULT_DOWNLOAD_FOLDER + item.Name);
-                            using (SqlConnection connection = new SqlConnection($"server=localhost;database={DATABASE_NAME};Integrated Security=yes"))
-                            using (SqlCommand sqlCmd = new SqlCommand($"insert into {ANIMATELIST_TABLE_NAME}(Name,DirPath) values ('{item.Name}','{DEFAULT_DOWNLOAD_FOLDER + item.Name}');", connection))
+                            if (_enableSQLServer)
                             {
-                                connection.Open();
-                                sqlCmd.ExecuteScalar();
-                                connection.Close();
+                                using (SqlConnection connection = new SqlConnection($"server=localhost;database={DATABASE_NAME};Integrated Security=yes"))
+                                using (SqlCommand sqlCmd = new SqlCommand($"insert into {ANIMATELIST_TABLE_NAME}(Name,DirPath) values ('{item.Name}','{DEFAULT_DOWNLOAD_FOLDER + item.Name}');", connection))
+                                {
+                                    connection.Open();
+                                    sqlCmd.ExecuteScalar();
+                                    connection.Close();
+                                }
                             }
                         }
                         var torrentParams = new AddTorrentParams { SavePath = DEFAULT_DOWNLOAD_FOLDER + item.Name, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
@@ -262,7 +272,12 @@ namespace TorrentConsole
                 }
             }).Wait();
         }
-        
-        private static bool CheckExists(XElement item) => Directory.Exists(DEFAULT_DOWNLOAD_FOLDER + Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim()) ? Directory.GetFiles(DEFAULT_DOWNLOAD_FOLDER + Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim(), Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value).Count() == 0 : true;
+
+        private static bool CheckExists(XElement item)
+        {
+            var title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim();
+            var fileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value;
+            return Directory.Exists(DEFAULT_DOWNLOAD_FOLDER + title) ? Directory.GetFiles(DEFAULT_DOWNLOAD_FOLDER + title, fileName).Count() == 0 : true;
+        }
     }
 }
