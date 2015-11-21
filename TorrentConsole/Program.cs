@@ -39,11 +39,13 @@ namespace TorrentConsole
         private const string REGEX_PATTERN = @"\[Leopard-Raws\](.+) - ([0-9]+) RAW";
         private static Dictionary<AddTorrentParams, TorrentHandle> _dic;
         private static string _downloadFolder = DEFAULT_DOWNLOAD_FOLDER;
+        private static bool _enableSQLServer;
         private static Session _session;
         private static Timer _timer;
-        private static bool _enableSQLServer;
 
-        private static async void _timer_Elapsed(object sender, ElapsedEventArgs e)
+        private static event EventHandler<FileInfo> DownloadComplete;
+
+        private static void _timer_Elapsed(object sender, ElapsedEventArgs e)
         {
             if (_dic.Count == 0) return;
             for (int i = 0; i < _dic.Count; i++)
@@ -54,17 +56,17 @@ namespace TorrentConsole
                     if (status.IsFinished || status.IsSeeding)
                     {
                         var info = new DirectoryInfo(status.SavePath).GetFiles().Where(file => file.Name == status.Name).FirstOrDefault();
-                        info.MoveTo($"{info.DirectoryName}{item.Key.Name}{Path.GetExtension(info.FullName)}");
-                        await ImportMedia(info.FullName, 1, 12);
+                        info.MoveTo($"{info.DirectoryName}\\{item.Key.Name}{Path.GetExtension(info.FullName)}");
                         _session.RemoveTorrent(item.Value);
                         _dic.Remove(item.Key);
+                        DownloadComplete?.Invoke(null, info);
                         Console.WriteLine($"{status.Name} is finished");
                     }
                     if (status.Error != "")
                     {
+                        Console.WriteLine($"{status.Name} error,try again");
                         _session.RemoveTorrent(item.Value);
                         _dic[item.Key] = _session.AddTorrent(item.Key);
-                        Console.WriteLine($"{status.Name} error,try again");
                     }
                 }
             }
@@ -91,6 +93,26 @@ namespace TorrentConsole
             catch (Exception)
             {
                 return false;
+            }
+        }
+
+        private static bool CheckExists(XElement item)
+        {
+            var title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim();
+            var fileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value;
+            return Directory.Exists(_downloadFolder + title) ? Directory.GetFiles(_downloadFolder + title, fileName).Count() == 0 : true;
+        }
+
+        private static void CheckForSqlServer()
+        {
+            if (!CheckDatabaseExists(DATABASE_NAME))
+            {
+                CreateDatabase(DATABASE_NAME);
+                CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
+            }
+            else if (!CheckTableExists(DATABASE_NAME, ANIMATELIST_TABLE_NAME))
+            {
+                CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
             }
         }
 
@@ -149,6 +171,56 @@ namespace TorrentConsole
             //TODO:make log
         }
 
+        private static async Task GetTorrents()
+        {
+            var rssStr = "";
+            try
+            {
+                Console.WriteLine("Getting rss...");
+                using (var client = new HttpClient())
+                    rssStr = await client.GetStringAsync("http://leopard-raws.org/rss.php");
+            }
+            catch (HttpRequestException) { return; }
+            catch (WebException) { return; }
+            if (string.IsNullOrEmpty(rssStr)) return;
+            XDocument doc = XDocument.Parse(rssStr);
+            var list = (from item in doc.Descendants()
+                        where item?.Name == "item"
+                        //check the item if exist
+                        && CheckExists(item)
+                        //check the item if is downloading
+                        && _dic.Where(download => download.Key.Url == item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value).Count() == 0
+                        select new
+                        {
+                            Title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[0].Value,
+                            Link = item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value,
+                            Name = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim(),
+                            FileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value.Trim(),
+                        }).ToList();
+            if (list.Count == 0) return;
+            foreach (var item in list)
+            {
+                if (!Directory.Exists(_downloadFolder + item.Name))
+                {
+                    Directory.CreateDirectory(_downloadFolder + item.Name);
+                    if (_enableSQLServer)
+                    {
+                        using (SqlConnection connection = new SqlConnection($"server=localhost;database={DATABASE_NAME};Integrated Security=yes"))
+                        using (SqlCommand sqlCmd = new SqlCommand($"insert into {ANIMATELIST_TABLE_NAME}(Name,DirPath) values ('{item.Name}','{_downloadFolder + item.Name}');", connection))
+                        {
+                            connection.Open();
+                            sqlCmd.ExecuteScalar();
+                            connection.Close();
+                        }
+                    }
+                }
+                var torrentParams = new AddTorrentParams { SavePath = _downloadFolder + item.Name, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
+                var handle = _session.AddTorrent(torrentParams);
+                _dic.Add(torrentParams, handle);
+                Console.WriteLine($"{item.Title} start downloading...");
+            }
+        }
+
         private static async Task ImportMedia(string mediaFile, int waitTime, int position, int imageWidth = 1280, int imageHeight = 720)
         {
             MediaPlayer player = new MediaPlayer { Volume = 0, ScrubbingEnabled = true };
@@ -182,29 +254,12 @@ namespace TorrentConsole
         private static void Main(string[] args)
         {
             Console.WriteLine("init...");
-            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
-            _dic = new Dictionary<AddTorrentParams, TorrentHandle>(new EqualityComparer<AddTorrentParams, string>(item => item.Url));
-            _session = new Session();
-            _session.ListenOn(6881, 6889);
-            var settings = _session.QuerySettings();
-            settings.UploadRateLimit = 30 * 1024;
-            settings.SeedTimeLimit = 1;
-            _session.SetSettings(settings);
-            _timer = new Timer(TimeSpan.FromSeconds(10d).TotalMilliseconds);
-            _timer.Elapsed += _timer_Elapsed;
+            VariableInit();
             Console.WriteLine("Enable SQL Server?(Y/N):");
             _enableSQLServer = Console.ReadLine() == "Y";
             if (_enableSQLServer)
             {
-                if (!CheckDatabaseExists(DATABASE_NAME))
-                {
-                    CreateDatabase(DATABASE_NAME);
-                    CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
-                }
-                else if (!CheckTableExists(DATABASE_NAME, ANIMATELIST_TABLE_NAME))
-                {
-                    CreateTable(DATABASE_NAME, ANIMATELIST_TABLE_NAME, "ID int identity(1,1) primary key,Name nvarchar(100) not null,DirPath nvarchar(100) not null");
-                }
+                CheckForSqlServer();
             }
             Console.WriteLine($"please set the download folder(by default: {_downloadFolder} ,press enter to keep the default):");
             _downloadFolder = Console.ReadLine();
@@ -225,62 +280,30 @@ namespace TorrentConsole
             {
                 while (true)
                 {
+                    await GetTorrents();
                     await Task.Delay(TimeSpan.FromMinutes(interval));
-                    var rssStr = "";
-                    try
-                    {
-                        Console.WriteLine("Getting rss...");
-                        using (var client = new HttpClient())
-                            rssStr = await client.GetStringAsync("http://leopard-raws.org/rss.php");
-                    }
-                    catch (HttpRequestException) { continue; }
-                    catch (WebException) { continue; }
-                    if (string.IsNullOrEmpty(rssStr)) continue;
-                    XDocument doc = XDocument.Parse(rssStr);
-                    var list = (from item in doc.Descendants()
-                                where item?.Name == "item"
-                                //check the item if exist
-                                && CheckExists(item)
-                                //check the item if is downloading
-                                && _dic.Where(download => download.Key.Url == item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value).Count() == 0
-                                select new
-                                {
-                                    Title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[0].Value,
-                                    Link = item.Descendants().Where(node => node.Name == "link").FirstOrDefault()?.Value,
-                                    Name = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim(),
-                                    FileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value.Trim(),
-                                }).ToList();
-                    if (list.Count == 0) continue;
-                    foreach (var item in list)
-                    {
-                        if (!Directory.Exists(_downloadFolder + item.Name))
-                        {
-                            Directory.CreateDirectory(_downloadFolder + item.Name);
-                            if (_enableSQLServer)
-                            {
-                                using (SqlConnection connection = new SqlConnection($"server=localhost;database={DATABASE_NAME};Integrated Security=yes"))
-                                using (SqlCommand sqlCmd = new SqlCommand($"insert into {ANIMATELIST_TABLE_NAME}(Name,DirPath) values ('{item.Name}','{_downloadFolder + item.Name}');", connection))
-                                {
-                                    connection.Open();
-                                    sqlCmd.ExecuteScalar();
-                                    connection.Close();
-                                }
-                            }
-                        }
-                        var torrentParams = new AddTorrentParams { SavePath = _downloadFolder + item.Name, Url = item.Link, UploadLimit = 10 * 1024, Name = item.FileName };
-                        var handle = _session.AddTorrent(torrentParams);
-                        _dic.Add(torrentParams, handle);
-                        Console.WriteLine($"{item.Title} start downloading...");
-                    }
                 }
             }).Wait();
         }
 
-        private static bool CheckExists(XElement item)
+        private static async void Program_DownloadComplete(object sender, FileInfo e)
         {
-            var title = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[1].Value.Trim();
-            var fileName = Regex.Match(item.Descendants().Where(node => node.Name == "title").FirstOrDefault()?.Value, REGEX_PATTERN).Groups[2].Value;
-            return Directory.Exists(_downloadFolder + title) ? Directory.GetFiles(_downloadFolder + title, fileName).Count() == 0 : true;
+            await ImportMedia(e.FullName, 1, 12);
+        }
+
+        private static void VariableInit()
+        {
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+            _dic = new Dictionary<AddTorrentParams, TorrentHandle>(new EqualityComparer<AddTorrentParams, string>(item => item.Url));
+            _session = new Session();
+            _session.ListenOn(6881, 6889);
+            var settings = _session.QuerySettings();
+            settings.UploadRateLimit = 30 * 1024;
+            settings.SeedTimeLimit = 1;
+            _session.SetSettings(settings);
+            _timer = new Timer(TimeSpan.FromSeconds(10d).TotalMilliseconds);
+            _timer.Elapsed += _timer_Elapsed;
+            DownloadComplete += Program_DownloadComplete;
         }
     }
 }
